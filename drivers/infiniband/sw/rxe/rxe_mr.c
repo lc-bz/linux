@@ -292,15 +292,39 @@ static size_t rxe_mr_dmabuf_offset(struct rxe_mr *mr, u64 iova)
 	return mr->dmabuf.offset + (iova - mr->ibmr.iova);
 }
 
+/*
+ * Order prior stores to the dma-buf before any later store. Release semantics,
+ * which publish data to normal memory, don't cover write-combining mappings.
+ */
+static void rxe_mr_dmabuf_wmb(struct rxe_mr *mr)
+{
+	if (mr->dmabuf.map.is_iomem)
+		wmb();	/* order dma-buf stores before later stores */
+}
+
+/*
+ * Order prior loads, e.g. of the lock or queue index that handed us this
+ * access, before reads from the dma-buf. Acquire semantics don't cover
+ * write-combining mappings, whose reads may be performed out of order.
+ */
+static void rxe_mr_dmabuf_rmb(struct rxe_mr *mr)
+{
+	if (mr->dmabuf.map.is_iomem)
+		rmb();	/* order dma-buf loads after earlier loads */
+}
+
 static void rxe_mr_copy_dmabuf(struct rxe_mr *mr, u64 iova, void *addr,
 			       unsigned int length, enum rxe_mr_copy_dir dir)
 {
 	size_t offset = rxe_mr_dmabuf_offset(mr, iova);
 
-	if (dir == RXE_TO_MR_OBJ)
+	if (dir == RXE_TO_MR_OBJ) {
 		iosys_map_memcpy_to(&mr->dmabuf.map, offset, addr, length);
-	else
+		rxe_mr_dmabuf_wmb(mr);
+	} else {
+		rxe_mr_dmabuf_rmb(mr);
 		iosys_map_memcpy_from(addr, &mr->dmabuf.map, offset, length);
+	}
 }
 
 int rxe_mr_init_fast(int max_pages, struct rxe_mr *mr)
@@ -668,6 +692,11 @@ static enum resp_states rxe_mr_dmabuf_atomic_op(struct rxe_mr *mr, u64 iova,
 	}
 
 	spin_lock_bh(&atomic_ops_lock);
+	/*
+	 * Ensures that I/O reads happen after the read that observed the
+	 * lock as free.
+	 */
+	rxe_mr_dmabuf_rmb(mr);
 	value = *orig_val = iosys_map_rd(&mr->dmabuf.map, offset, u64);
 
 	if (opcode == IB_OPCODE_RC_COMPARE_SWAP) {
@@ -676,6 +705,11 @@ static enum resp_states rxe_mr_dmabuf_atomic_op(struct rxe_mr *mr, u64 iova,
 	} else {
 		iosys_map_wr(&mr->dmabuf.map, offset, u64, value + swap_add);
 	}
+	/*
+	 * Ensures the lock may be observed as free only after all I/O writes
+	 * were already issued.
+	 */
+	rxe_mr_dmabuf_wmb(mr);
 	spin_unlock_bh(&atomic_ops_lock);
 
 	return RESPST_NONE;
@@ -768,12 +802,13 @@ enum resp_states rxe_mr_do_atomic_write(struct rxe_mr *mr, u64 iova, u64 value)
 		}
 
 		/*
-		 * Do atomic write after all prior operations have completed;
-		 * wmb() also drains write-combining buffers when the mapping
-		 * is I/O memory.
+		 * Do atomic write after all prior operations have completed.
+		 * Unconditional, unlike rxe_mr_dmabuf_wmb(): the prior stores
+		 * may have gone to any MR, including write-combining ones.
 		 */
 		wmb();
 		iosys_map_wr(&mr->dmabuf.map, offset, u64, value);
+		rxe_mr_dmabuf_wmb(mr);
 		return RESPST_NONE;
 	}
 

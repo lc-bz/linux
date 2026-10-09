@@ -5,9 +5,15 @@
  */
 
 #include <linux/libnvdimm.h>
+#include <linux/dma-buf.h>
+#include <linux/iosys-map.h>
+#include <linux/module.h>
+#include <linux/overflow.h>
 
 #include "rxe.h"
 #include "rxe_loc.h"
+
+MODULE_IMPORT_NS("DMA_BUF");
 
 /* Return a random 8 bit key value that is
  * different than the last_key. Set last_key to -1
@@ -224,6 +230,79 @@ err2:
 	return err;
 }
 
+/*
+ * We use dma_buf_vmap_unlocked() to obtain a kernel mapping of the dma-buf
+ * and allow for CPU access, so the exporter must implement vmap.
+ * We hold a reference to the dma-buf until the MR is destroyed to prevent the
+ * user from freeing the memory while rxe may still access it.
+ */
+int rxe_mr_init_dmabuf(struct rxe_dev *rxe, u64 offset, u64 length, u64 iova,
+		       int fd, int access, struct rxe_mr *mr)
+{
+	struct dma_buf *dmabuf;
+	u64 end;
+	int err;
+
+	rxe_mr_init(access, mr);
+
+	if (length == 0 || check_add_overflow(offset, length, &end)) {
+		rxe_dbg_mr(mr, "invalid range %#llx+%#llx\n", offset, length);
+		return -EINVAL;
+	}
+
+	dmabuf = dma_buf_get(fd);
+	if (IS_ERR(dmabuf)) {
+		rxe_dbg_mr(mr, "invalid dma-buf fd %d\n", fd);
+		return PTR_ERR(dmabuf);
+	}
+
+	if (dmabuf->size < end) {
+		rxe_dbg_mr(mr, "range %#llx+%#llx exceeds dma-buf size %#zx\n",
+			   offset, length, dmabuf->size);
+		err = -EINVAL;
+		goto err_put;
+	}
+
+	err = dma_buf_vmap_unlocked(dmabuf, &mr->dmabuf.map);
+	if (err) {
+		rxe_dbg_mr(mr, "dma_buf_vmap failed, err = %d\n", err);
+		goto err_put;
+	}
+
+	mr->dmabuf.buf = dmabuf;
+	mr->dmabuf.offset = offset;
+	mr->ibmr.type = IB_MR_TYPE_USER;
+	mr->ibmr.iova = iova;
+	mr->ibmr.length = length;
+	mr->state = RXE_MR_STATE_VALID;
+
+	return 0;
+
+err_put:
+	dma_buf_put(dmabuf);
+	return err;
+}
+
+/*
+ * Byte offset of iova in the dma-buf mapping.
+ * Callers must have validated iova with mr_check_range() first.
+ */
+static size_t rxe_mr_dmabuf_offset(struct rxe_mr *mr, u64 iova)
+{
+	return mr->dmabuf.offset + (iova - mr->ibmr.iova);
+}
+
+static void rxe_mr_copy_dmabuf(struct rxe_mr *mr, u64 iova, void *addr,
+			       unsigned int length, enum rxe_mr_copy_dir dir)
+{
+	size_t offset = rxe_mr_dmabuf_offset(mr, iova);
+
+	if (dir == RXE_TO_MR_OBJ)
+		iosys_map_memcpy_to(&mr->dmabuf.map, offset, addr, length);
+	else
+		iosys_map_memcpy_from(addr, &mr->dmabuf.map, offset, length);
+}
+
 int rxe_mr_init_fast(int max_pages, struct rxe_mr *mr)
 {
 	int err;
@@ -403,6 +482,11 @@ int rxe_mr_copy(struct rxe_mr *mr, u64 iova, void *addr,
 		return err;
 	}
 
+	if (is_dmabuf_mr(mr)) {
+		rxe_mr_copy_dmabuf(mr, iova, addr, length, dir);
+		return 0;
+	}
+
 	if (is_odp_mr(mr))
 		return rxe_odp_mr_copy(mr, iova, addr, length, dir);
 	else
@@ -550,6 +634,10 @@ int rxe_flush_pmem_iova(struct rxe_mr *mr, u64 start, unsigned int length)
 	if (mr->ibmr.type == IB_MR_TYPE_DMA)
 		return -EFAULT;
 
+	/* dma-buf memory is never persistent memory */
+	if (is_dmabuf_mr(mr))
+		return -EFAULT;
+
 	if (is_odp_mr(mr))
 		err = rxe_odp_flush_pmem_iova(mr, start, length);
 	else
@@ -560,6 +648,38 @@ int rxe_flush_pmem_iova(struct rxe_mr *mr, u64 start, unsigned int length)
 
 /* Guarantee atomicity of atomic operations at the machine level. */
 DEFINE_SPINLOCK(atomic_ops_lock);
+
+static enum resp_states rxe_mr_dmabuf_atomic_op(struct rxe_mr *mr, u64 iova,
+						int opcode, u64 compare,
+						u64 swap_add, u64 *orig_val)
+{
+	size_t offset;
+	u64 value;
+
+	if (mr_check_range(mr, iova, sizeof(value))) {
+		rxe_dbg_mr(mr, "iova out of range\n");
+		return RESPST_ERR_RKEY_VIOLATION;
+	}
+
+	offset = rxe_mr_dmabuf_offset(mr, iova);
+	if (unlikely(offset & 0x7)) {
+		rxe_dbg_mr(mr, "iova not aligned\n");
+		return RESPST_ERR_MISALIGNED_ATOMIC;
+	}
+
+	spin_lock_bh(&atomic_ops_lock);
+	value = *orig_val = iosys_map_rd(&mr->dmabuf.map, offset, u64);
+
+	if (opcode == IB_OPCODE_RC_COMPARE_SWAP) {
+		if (value == compare)
+			iosys_map_wr(&mr->dmabuf.map, offset, u64, swap_add);
+	} else {
+		iosys_map_wr(&mr->dmabuf.map, offset, u64, value + swap_add);
+	}
+	spin_unlock_bh(&atomic_ops_lock);
+
+	return RESPST_NONE;
+}
 
 enum resp_states rxe_mr_do_atomic_op(struct rxe_mr *mr, u64 iova, int opcode,
 				     u64 compare, u64 swap_add, u64 *orig_val)
@@ -573,6 +693,10 @@ enum resp_states rxe_mr_do_atomic_op(struct rxe_mr *mr, u64 iova, int opcode,
 		rxe_dbg_mr(mr, "mr not in valid state\n");
 		return RESPST_ERR_RKEY_VIOLATION;
 	}
+
+	if (is_dmabuf_mr(mr))
+		return rxe_mr_dmabuf_atomic_op(mr, iova, opcode, compare,
+					       swap_add, orig_val);
 
 	if (mr->ibmr.type == IB_MR_TYPE_DMA) {
 		page_offset = iova & (PAGE_SIZE - 1);
@@ -626,6 +750,32 @@ enum resp_states rxe_mr_do_atomic_write(struct rxe_mr *mr, u64 iova, u64 value)
 	unsigned int page_offset;
 	struct page *page;
 	u64 *va;
+
+	if (is_dmabuf_mr(mr)) {
+		size_t offset;
+
+		/* See IBA oA19-28 */
+		if (unlikely(mr_check_range(mr, iova, sizeof(value)))) {
+			rxe_dbg_mr(mr, "iova out of range\n");
+			return RESPST_ERR_RKEY_VIOLATION;
+		}
+
+		/* See IBA A19.4.2 */
+		offset = rxe_mr_dmabuf_offset(mr, iova);
+		if (unlikely(offset & 0x7)) {
+			rxe_dbg_mr(mr, "misaligned address\n");
+			return RESPST_ERR_MISALIGNED_ATOMIC;
+		}
+
+		/*
+		 * Do atomic write after all prior operations have completed;
+		 * wmb() also drains write-combining buffers when the mapping
+		 * is I/O memory.
+		 */
+		wmb();
+		iosys_map_wr(&mr->dmabuf.map, offset, u64, value);
+		return RESPST_NONE;
+	}
 
 	if (mr->ibmr.type == IB_MR_TYPE_DMA) {
 		page_offset = iova & (PAGE_SIZE - 1);
@@ -809,6 +959,12 @@ void rxe_mr_cleanup(struct rxe_pool_elem *elem)
 	struct rxe_mr *mr = container_of(elem, typeof(*mr), elem);
 
 	rxe_put(mr_pd(mr));
+
+	if (is_dmabuf_mr(mr)) {
+		dma_buf_vunmap_unlocked(mr->dmabuf.buf, &mr->dmabuf.map);
+		dma_buf_put(mr->dmabuf.buf);
+	}
+
 	ib_umem_release(mr->umem);
 
 	if (mr->ibmr.type != IB_MR_TYPE_DMA)

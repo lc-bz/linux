@@ -1324,6 +1324,58 @@ err_free:
 	return ERR_PTR(err);
 }
 
+static struct ib_mr *rxe_reg_user_mr_dmabuf(struct ib_pd *ibpd, u64 offset,
+					    u64 length, u64 iova, int fd,
+					    int access, struct ib_dmah *dmah,
+					    struct uverbs_attr_bundle *attrs)
+{
+	struct rxe_dev *rxe = to_rdev(ibpd->device);
+	struct rxe_pd *pd = to_rpd(ibpd);
+	struct rxe_mr *mr;
+	int err, cleanup_err;
+
+	if (dmah)
+		return ERR_PTR(-EOPNOTSUPP);
+
+	if (access & ~RXE_ACCESS_SUPPORTED_MR) {
+		rxe_err_pd(pd, "access = %#x not supported (%#x)\n", access,
+			   RXE_ACCESS_SUPPORTED_MR);
+		return ERR_PTR(-EOPNOTSUPP);
+	}
+
+	mr = kzalloc_obj(*mr);
+	if (!mr)
+		return ERR_PTR(-ENOMEM);
+
+	err = rxe_add_to_pool(&rxe->mr_pool, mr);
+	if (err) {
+		rxe_dbg_pd(pd, "unable to create mr\n");
+		goto err_free;
+	}
+
+	rxe_get(pd);
+	mr->ibmr.pd = ibpd;
+	mr->ibmr.device = ibpd->device;
+
+	err = rxe_mr_init_dmabuf(rxe, offset, length, iova, fd, access, mr);
+	if (err) {
+		rxe_dbg_mr(mr, "reg_user_mr_dmabuf failed, err = %d\n", err);
+		goto err_cleanup;
+	}
+
+	rxe_finalize(mr);
+	return &mr->ibmr;
+
+err_cleanup:
+	cleanup_err = rxe_cleanup(mr);
+	if (cleanup_err)
+		rxe_err_mr(mr, "cleanup failed, err = %d\n", cleanup_err);
+err_free:
+	kfree(mr);
+	rxe_err_pd(pd, "returned err = %d\n", err);
+	return ERR_PTR(err);
+}
+
 static struct ib_mr *rxe_rereg_user_mr(struct ib_mr *ibmr, int flags,
 				       u64 start, u64 length, u64 iova,
 				       int access, struct ib_pd *ibpd,
@@ -1517,6 +1569,7 @@ static const struct ib_device_ops rxe_dev_ops = {
 	.query_qp = rxe_query_qp,
 	.query_srq = rxe_query_srq,
 	.reg_user_mr = rxe_reg_user_mr,
+	.reg_user_mr_dmabuf = rxe_reg_user_mr_dmabuf,
 	.req_notify_cq = rxe_req_notify_cq,
 	.rereg_user_mr = rxe_rereg_user_mr,
 	.resize_cq = rxe_resize_cq,

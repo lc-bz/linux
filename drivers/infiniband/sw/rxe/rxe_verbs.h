@@ -9,6 +9,8 @@
 
 #include <linux/interrupt.h>
 #include <linux/workqueue.h>
+#include <linux/dma-buf.h>
+#include <linux/iosys-map.h>
 #include "rxe_pool.h"
 #include "rxe_task.h"
 #include "rxe_hw_counters.h"
@@ -340,6 +342,13 @@ struct rxe_mr_page {
 	unsigned int		offset; /* offset in system page */
 };
 
+/* dma-buf MRs use the exporter's mapping, which may be I/O memory */
+struct rxe_mr_dmabuf {
+	struct dma_buf		*buf;	/* NULL unless this is a dma-buf MR */
+	struct iosys_map	map;	/* mapping of the whole dma-buf */
+	u64			offset;	/* offset of ibmr.iova in the dma-buf */
+};
+
 struct rxe_mr {
 	struct rxe_pool_elem	elem;
 	struct ib_mr		ibmr;
@@ -362,6 +371,9 @@ struct rxe_mr {
 	u32			nbuf;
 
 	struct rxe_mr_page	*page_info;
+
+	/* only for dma-buf MRs, see rxe_mr_init_dmabuf() */
+	struct rxe_mr_dmabuf	dmabuf;
 };
 
 static inline unsigned int mr_page_size(struct rxe_mr *mr)

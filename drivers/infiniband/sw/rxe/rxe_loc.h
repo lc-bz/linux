@@ -62,6 +62,8 @@ void rxe_mr_init(int access, struct rxe_mr *mr);
 void rxe_mr_init_dma(int access, struct rxe_mr *mr);
 int rxe_mr_init_user(struct rxe_dev *rxe, u64 start, u64 length,
 		     int access, struct rxe_mr *mr);
+int rxe_mr_init_dmabuf(struct rxe_dev *rxe, u64 offset, u64 length, u64 iova,
+		       int fd, int access, struct rxe_mr *mr);
 int rxe_mr_init_fast(int max_pages, struct rxe_mr *mr);
 int rxe_flush_pmem_iova(struct rxe_mr *mr, u64 iova, unsigned int length);
 int rxe_mr_copy(struct rxe_mr *mr, u64 iova, void *addr,
@@ -144,6 +146,11 @@ static inline bool is_odp_mr(struct rxe_mr *mr)
 {
 	return IS_ENABLED(CONFIG_INFINIBAND_ON_DEMAND_PAGING) && mr->umem &&
 	       mr->umem->is_odp;
+}
+
+static inline bool is_dmabuf_mr(struct rxe_mr *mr)
+{
+	return mr->dmabuf.buf;
 }
 
 void free_rd_atomic_resource(struct resp_res *res);
